@@ -163,4 +163,8 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
     gateway.unload()
     del hass.data[DATA_ELTAKO][gateway.dev_name]
 
-    return True
+    unload_ok = await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
+
+    return unload_ok
+
+    
