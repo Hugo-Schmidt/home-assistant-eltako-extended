@@ -1,4 +1,4 @@
-# Usage of Gatways
+# Usage of Gateways
 
 Hints: 
 * Have you checked out the different gatewys and their characteristics? [Supported Gateways](../gateways/readme.md)
