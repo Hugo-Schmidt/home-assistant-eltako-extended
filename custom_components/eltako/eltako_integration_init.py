@@ -149,7 +149,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     #     hass.async_create_task(
     #         hass.config_entries.async_forward_entry_setup(config_entry, platform)
     #     )
-    await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
 
 
     return True
@@ -163,8 +163,6 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
     gateway.unload()
     del hass.data[DATA_ELTAKO][gateway.dev_name]
 
-    unload_ok = await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
-
-    return unload_ok
+    return True
 
     
