@@ -117,7 +117,7 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
             self._attr_is_opening = None
             self._attr_is_closing = None
             self._attr_is_closed = None # means undefined state
-            raise e
+            # raise e
         
         self.schedule_update_ha_state()
         LOGGER.debug(f"[cover {self.dev_id}] value initially loaded: [" 
