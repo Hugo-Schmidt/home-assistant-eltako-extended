@@ -1,5 +1,8 @@
 # Changes and Feature List
 
+## Version 1.5.10 Bugfix Covers
+* Initialization problem through unknown initial position 
+
 ## Version 1.5.9 Fix to make it compatible to 2025.10
 * Fixed loading configuration since changes of 2025.10
 

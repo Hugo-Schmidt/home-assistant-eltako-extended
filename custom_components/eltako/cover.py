@@ -85,8 +85,8 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
         # LOGGER.debug(f"[cover {self.dev_id}] latest state: {latest_state.state}")
         # LOGGER.debug(f"[cover {self.dev_id}] latest state attributes: {latest_state.attributes}")
         try:
-            self._attr_current_cover_position = latest_state.attributes['current_position']
-            self._attr_current_cover_tilt_position = latest_state.attributes['current_tilt_position']
+            self._attr_current_cover_position = latest_state.attributes.get('current_position')
+            self._attr_current_cover_tilt_position = latest_state.attributes.get('current_tilt_position')
 
             #if self._attr_current_cover_tilt_position == 0:
             #    self._attr_current_cover_tilt_position = 0
