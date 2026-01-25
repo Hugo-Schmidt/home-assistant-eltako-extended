@@ -383,7 +383,7 @@ class EnOceanGateway:
         """
 
         if type(message) not in [EltakoPoll]:
-            LOGGER.debug("[Gateway] [Id: %d] Received message: %s", self.dev_id, message)
+            # LOGGER.debug("[Gateway] [Id: %d] Received message: %s", self.dev_id, message)
             self.report_message_stats()
 
             if message.body[:2] == b'\x8b\x98':
@@ -416,7 +416,7 @@ class EnOceanGateway:
                             global_msg = prettify(ESP2Message( ba ))
 
 
-                    LOGGER.debug("[Gateway] [Id: %d] Forwared message (%s) in global bus", self.dev_id, global_msg)
+                    LOGGER.debug("[Gateway] [Id: %d] Forwared message %s in global bus as %s", self.dev_id, message, global_msg)
                     dispatcher_send(self.hass, ELTAKO_GLOBAL_EVENT_BUS_ID, {'gateway':self, 'esp2_msg': global_msg})
             
     

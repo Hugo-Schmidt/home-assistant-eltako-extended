@@ -916,7 +916,7 @@ class GatewayReceivedMessagesInActiveSession(EltakoSensor):
                             # device_class=SensorDeviceClass.VOLUME,
                             # native_unit_of_measurement="Messages", # => raises error message
                             unit_of_measurement="count",
-                            suggested_unit_of_measurement="Messages",
+                            # suggested_unit_of_measurement="Messages", # => raises error message
                             icon="mdi:chart-line",
                         )
         )
