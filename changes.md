@@ -1,9 +1,32 @@
 # Changes and Feature List
 
+## Version 1.5.11
+The FSB14 shutter actuator does not send a confirmation telegram after HA-initiated commands — only physical button presses trigger a state update. This means cover position was always stale after automations.
+
+This patch introduces client-side time-based position tracking:
+- after each HA command a timer runs for the configured travel time and sets the final position.
+- Physical telegrams cancel the timer so hardware truth always wins.
+- A bus ACK (state=0x00) correctly does NOT cancel the timer.
+Additionally, cover position is now exposed as a sensor entity and travel times from YAML config are visible in device properties.
+
+**cover.py**
+- Add asyncio-based travel timer to track FSB14 cover position after HA-initiated commands (open, close, set_position, stop)
+- Add async_open_cover, async_close_cover, async_set_cover_position, async_stop_cover overrides that start/cancel the travel timer
+- Fix: state=0x00 (bus ACK) no longer cancels the travel timer — only confirmed end-states (0x50 closed, 0x70 open) and physical runtime telegrams cancel the timer
+- stop_cover calculates intermediate position from elapsed travel time
+- Fix: rename `import time` to `import time as time_module` to avoid shadowing by local variables
+- 
+**sensor.py**
+- Add EltakoCoverPositionSensor class: mirrors current_cover_position from the cover entity as a dedicated sensor (% unit), auto-created for every cover with time_closes + time_opens configured
+- Add StaticInfoField entries for time closing and time opening, making travel times visible in device properties
+  
 ## Version 1.5.10 Bugfix Covers
 * Initialization problem through unknown initial position 
 
 ## Version 1.5.9 Fix to make it compatible to 2025.10
+* Replaced deprecated log function warn through warning
+* Fixed deprecation warning for async_forward_entry_setup
+* Replaced unsupported function from HA core.
 * Fixed loading configuration since changes of 2025.10
 
 ## Version 1.5.8
