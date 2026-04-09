@@ -1,4 +1,4 @@
-"""Support for Eltako sensors."""
+"""Support for Eltako sensors. - """
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -34,7 +34,10 @@ from homeassistant.const import (
     UnitOfElectricPotential,
 )
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
+# from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_state_change_event
+
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -425,6 +428,29 @@ async def async_setup_entry(
     entities.append(GatewayLastReceivedMessage(platform, gateway))
     entities.append(GatewayReceivedMessagesInActiveSession(platform, gateway))
 
+    # Position sensors for covers and travel time info for covers (pls engineering)
+    if Platform.COVER in config:
+        for entity_config in config[Platform.COVER]:
+            try:
+                dev_conf = DeviceConf(entity_config, [CONF_TIME_CLOSES, CONF_TIME_OPENS])
+                time_closes = dev_conf.get(CONF_TIME_CLOSES)
+                time_opens = dev_conf.get(CONF_TIME_OPENS)
+                if time_closes and time_opens:
+                    entities.append(EltakoCoverPositionSensor(
+                        platform, gateway, dev_conf.id, dev_conf.name, dev_conf.eep
+                    ))
+                    entities.append(StaticInfoField(
+                        platform, gateway, dev_conf.id, dev_conf.name, dev_conf.eep,
+                        "Zeit Schliessen", f"{time_closes} s", "mdi:timer-minus-outline"
+                    ))
+                    entities.append(StaticInfoField(
+                        platform, gateway, dev_conf.id, dev_conf.name, dev_conf.eep,
+                        "Zeit Oeffnen", f"{time_opens} s", "mdi:timer-plus-outline"
+                    ))
+            except Exception as e:
+                LOGGER.warning("[%s] Could not load cover position sensor", platform)
+                LOGGER.critical(e, exc_info=True)
+ 
     validate_actuators_dev_and_sender_id(entities)
     log_entities_to_be_added(entities, platform)
     async_add_entities(entities)
@@ -1017,4 +1043,56 @@ class EventListenerInfoField(EltakoSensor):
         self.native_value = self.convert_event_function(event)
 
         self.schedule_update_ha_state()
-            
+
+# Extention to make cover position accesable
+# author: pls engineering
+# date: 2026-04-09
+class EltakoCoverPositionSensor(EltakoSensor):
+    """Position sensor for an Eltako cover.
+    
+    Mirrors current_cover_position from the corresponding cover entity.
+    No bus logic — subscribes to cover state changes instead.
+    """
+
+    def __init__(self, platform: str, gateway: EnOceanGateway,
+                 dev_id: AddressExpression, dev_name: str, dev_eep: EEP) -> None:
+        super().__init__(
+            platform, gateway, dev_id, dev_name, dev_eep,
+            description=EltakoSensorEntityDescription(
+                key="cover_position",
+                name="Position",
+                native_unit_of_measurement=PERCENTAGE,
+                icon="mdi:arrow-up-down",
+                state_class=SensorStateClass.MEASUREMENT,
+                suggested_display_precision=0,
+            )
+        )
+        self._attr_native_value = None
+        # Don't react to bus messages directly — position comes from cover entity
+        self.listen_to_addresses.clear()
+        self._unsubscribe_state = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        cover_entity_id = self.entity_id.replace("sensor.", "cover.").replace("_cover_position", "")
+        LOGGER.debug(f"[cover position sensor {self.dev_id}] subscribing to {cover_entity_id}")
+        self._unsubscribe_state = async_track_state_change_event(
+            self.hass, [cover_entity_id], self._handle_cover_state_change
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsubscribe_state:
+            self._unsubscribe_state()
+
+    @callback
+    def _handle_cover_state_change(self, event) -> None:
+        new_state = event.data.get('new_state')
+        if new_state is None:
+            return
+        pos = new_state.attributes.get('current_position')
+        if pos is not None:
+            self._attr_native_value = int(pos)
+            self.schedule_update_ha_state()
+
+    def value_changed(self, msg) -> None:
+        pass  # Handled via cover state subscription

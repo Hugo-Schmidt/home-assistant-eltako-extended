@@ -1,6 +1,7 @@
-"""Support for Eltako covers."""
+"""Support for Eltako covers. - v1510 Patch1"""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from eltakobus.util import AddressExpression
@@ -19,7 +20,7 @@ from .config_helpers import DeviceConf
 from .gateway import EnOceanGateway
 from .const import CONF_SENDER, CONF_TIME_CLOSES, CONF_TIME_OPENS, CONF_TIME_TILTS, DOMAIN, MANUFACTURER, LOGGER
 from . import get_gateway_from_hass, get_device_config_for_gateway
-import time
+import time as time_module  # renamed to avoid shadowing by local 'time' variables
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -71,6 +72,14 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
         self._time_closes = time_closes
         self._time_opens = time_opens
         self._time_tilts = time_tilts
+
+        # --- FSB14 time-based position tracking ---
+        self._travel_task = None          # asyncio Task running during movement
+        self._travel_start_time = None    # monotonic timestamp when movement started
+        self._travel_direction = None     # "up" or "down"
+        self._travel_start_position = None  # position at movement start (0-100)
+        self._travel_target_position = None # position at movement end (0-100)
+        # ------------------------------------------
         
         self._attr_supported_features = (CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP)
         
@@ -82,14 +91,10 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
 
 
     def load_value_initially(self, latest_state:State):
-        # LOGGER.debug(f"[cover {self.dev_id}] latest state: {latest_state.state}")
-        # LOGGER.debug(f"[cover {self.dev_id}] latest state attributes: {latest_state.attributes}")
         try:
             self._attr_current_cover_position = latest_state.attributes.get('current_position')
             self._attr_current_cover_tilt_position = latest_state.attributes.get('current_tilt_position')
 
-            #if self._attr_current_cover_tilt_position == 0:
-            #    self._attr_current_cover_tilt_position = 0
             if latest_state.state == STATE_OPEN:
                 self._attr_is_opening = False
                 self._attr_is_closing = False
@@ -117,7 +122,6 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
             self._attr_is_opening = None
             self._attr_is_closing = None
             self._attr_is_closed = None # means undefined state
-            # raise e
         
         self.schedule_update_ha_state()
         LOGGER.debug(f"[cover {self.dev_id}] value initially loaded: [" 
@@ -128,9 +132,75 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
                      + f"current_tilt_position: {self._attr_current_cover_tilt_position}, "
                      + f"state: {self.state}]")
 
+    # -------------------------------------------------------------------------
+    # Travel timer helpers
+    # -------------------------------------------------------------------------
+
+    def _cancel_travel_task(self) -> None:
+        """Cancel any running travel timer without updating position."""
+        if self._travel_task and not self._travel_task.done():
+            self._travel_task.cancel()
+        self._travel_task = None
+
+    def _calc_intermediate_position(self) -> int | None:
+        """Calculate current position based on elapsed travel time."""
+        if (self._travel_start_time is None
+                or self._travel_direction is None
+                or self._travel_start_position is None):
+            return None
+
+        elapsed = time_module.monotonic() - self._travel_start_time
+
+        if self._travel_direction == "up" and self._time_opens:
+            traveled = int((elapsed / self._time_opens) * 100)
+            return min(self._travel_start_position + traveled, 100)
+        elif self._travel_direction == "down" and self._time_closes:
+            traveled = int((elapsed / self._time_closes) * 100)
+            return max(self._travel_start_position - traveled, 0)
+
+        return None
+
+    async def _async_finish_travel(self, travel_time: float, target_position: int) -> None:
+        """Wait for travel_time seconds then set final position.
+        
+        Fires after HA sends a command when no confirmation telegram is
+        expected from the FSB14 (RS485 bus, HA-initiated commands).
+        Physical button presses trigger value_changed() which cancels this task.
+        """
+        try:
+            await asyncio.sleep(travel_time)
+        except asyncio.CancelledError:
+            return
+
+        self._attr_current_cover_position = target_position
+        self._attr_is_closed = (target_position == 0)
+        self._attr_is_opening = False
+        self._attr_is_closing = False
+        self._travel_task = None
+        self.schedule_update_ha_state()
+        LOGGER.debug(f"[cover {self.dev_id}] travel timer finished: position={target_position}")
+
+    def _start_travel(self, direction: str, start_position: int, target_position: int, travel_time: float) -> None:
+        """Start movement tracking: cancel any previous task and launch a new one."""
+        self._cancel_travel_task()
+        self._travel_start_time = time_module.monotonic()
+        self._travel_direction = direction
+        self._travel_start_position = start_position
+        self._travel_target_position = target_position
+        self._travel_task = self.hass.async_create_task(
+            self._async_finish_travel(travel_time, target_position)
+        )
+        LOGGER.debug(
+            f"[cover {self.dev_id}] travel started: direction={direction}, "
+            f"from={start_position} to={target_position}, time={travel_time}s"
+        )
+
+    # -------------------------------------------------------------------------
+    # Cover commands
+    # -------------------------------------------------------------------------
 
     def open_cover(self, **kwargs: Any) -> None:
-        """Open the cover."""
+        """Open the cover (sends bus message)."""
         if self._time_opens is not None:
             time = self._time_opens + 1
         else:
@@ -141,22 +211,30 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
         if self._sender_eep == H5_3F_7F:
             msg = H5_3F_7F(time, 0x01, 1).encode_message(address)
             self.send_message(msg)
-
         else:
             LOGGER.warn("[%s %s] Sender EEP %s not supported.", Platform.COVER, str(self.dev_id), self._sender_eep.eep_string)
             return
         
-        #TODO: ... setting state should be comment out
-        # Don't set state instead wait for response from actor so that real state of light is displayed.
         if self.general_settings[CONF_FAST_STATUS_CHANGE]:
             self._attr_is_opening = True
             self._attr_is_closing = False
-            
             self.schedule_update_ha_state()
-    
+
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        """Open the cover and start time-based position tracking."""
+        self.open_cover(**kwargs)
+
+        if self._time_opens is not None:
+            start_pos = self._attr_current_cover_position if self._attr_current_cover_position is not None else 0
+            self._start_travel(
+                direction="up",
+                start_position=start_pos,
+                target_position=100,
+                travel_time=self._time_opens,
+            )
 
     def close_cover(self, **kwargs: Any) -> None:
-        """Close cover."""
+        """Close cover (sends bus message)."""
         if self._time_closes is not None:
             time = self._time_closes + 1
         else:
@@ -167,21 +245,30 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
         if self._sender_eep == H5_3F_7F:
             msg = H5_3F_7F(time, 0x02, 1).encode_message(address)
             self.send_message(msg)
-
         else:
             LOGGER.warn("[%s %s] Sender EEP %s not supported.", Platform.COVER, str(self.dev_id), self._sender_eep.eep_string)
             return
         
-        #TODO: ... setting state should be comment out
-        # Don't set state instead wait for response from actor so that real state of light is displayed.
         if self.general_settings[CONF_FAST_STATUS_CHANGE]:
             self._attr_is_closing = True
             self._attr_is_opening = False
-
             self.schedule_update_ha_state()
 
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Close the cover and start time-based position tracking."""
+        self.close_cover(**kwargs)
+
+        if self._time_closes is not None:
+            start_pos = self._attr_current_cover_position if self._attr_current_cover_position is not None else 100
+            self._start_travel(
+                direction="down",
+                start_position=start_pos,
+                target_position=0,
+                travel_time=self._time_closes,
+            )
+
     def set_cover_position(self, **kwargs: Any) -> None:
-        """Move the cover to a specific position."""
+        """Move the cover to a specific position (sends bus message)."""
         if self._time_closes is None or self._time_opens is None:
             return
         
@@ -198,12 +285,10 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
             time = self._time_closes + 1
         elif position > self._attr_current_cover_position:
             direction = "up"
-            time = max(1,min(int(((position - self._attr_current_cover_position) / 100.0) * self._time_opens), 255))
-            # try to prevent covers moving completely up or down when time = 0
+            time = max(1, min(int(((position - self._attr_current_cover_position) / 100.0) * self._time_opens), 255))
         elif position < self._attr_current_cover_position:
             direction = "down"
-            time = max(1,min(int(((self._attr_current_cover_position - position) / 100.0) * self._time_closes), 255))
-            # try to prevent covers moving completely up or down when time = 0
+            time = max(1, min(int(((self._attr_current_cover_position - position) / 100.0) * self._time_closes), 255))
 
         if self._sender_eep == H5_3F_7F:
             if direction == "up":
@@ -213,7 +298,6 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
             
             msg = H5_3F_7F(time, command, 1).encode_message(address)
             self.send_message(msg)
-
         else:
             LOGGER.warn("[%s %s] Sender EEP %s not supported.", Platform.COVER, str(self.dev_id), self._sender_eep.eep_string)
             return
@@ -225,12 +309,43 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
             elif direction == "down":
                 self._attr_is_closing = True
                 self._attr_is_opening = False
-                
             self.schedule_update_ha_state()
-        
+
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
+        """Move to position and start time-based tracking."""
+        if self._time_closes is None or self._time_opens is None:
+            return
+
+        position = kwargs[ATTR_POSITION]
+        if position == self._attr_current_cover_position:
+            return
+
+        current = self._attr_current_cover_position if self._attr_current_cover_position is not None else 50
+
+        if position >= 100:
+            direction = "up"
+            travel_time = float(self._time_opens)
+        elif position <= 0:
+            direction = "down"
+            travel_time = float(self._time_closes)
+        elif position > current:
+            direction = "up"
+            travel_time = max(1.0, ((position - current) / 100.0) * self._time_opens)
+        else:
+            direction = "down"
+            travel_time = max(1.0, ((current - position) / 100.0) * self._time_closes)
+
+        self.set_cover_position(**kwargs)  # sends the bus message
+
+        self._start_travel(
+            direction=direction,
+            start_position=current,
+            target_position=position,
+            travel_time=travel_time,
+        )
 
     def stop_cover(self, **kwargs: Any) -> None:
-        """Stop the cover."""
+        """Stop the cover (sends bus message)."""
         address, _ = self._sender_id
 
         if self._sender_eep == H5_3F_7F:
@@ -240,12 +355,35 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
         if self.general_settings[CONF_FAST_STATUS_CHANGE]:
             self._attr_is_closing = False
             self._attr_is_opening = False
-
             self.schedule_update_ha_state()
 
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        """Stop the cover and calculate intermediate position from elapsed time."""
+        intermediate = self._calc_intermediate_position()
+
+        self._cancel_travel_task()
+        self.stop_cover(**kwargs)  # sends the bus message
+
+        if intermediate is not None:
+            self._attr_current_cover_position = intermediate
+            self._attr_is_closed = (intermediate == 0)
+            self._attr_is_opening = False
+            self._attr_is_closing = False
+            self.schedule_update_ha_state()
+            LOGGER.debug(f"[cover {self.dev_id}] stop_cover: intermediate position={intermediate}")
+
+    # -------------------------------------------------------------------------
+    # Incoming telegram from FSB14 (physical button press or end-stop reached)
+    # -------------------------------------------------------------------------
 
     def value_changed(self, msg):
-        """Update the internal state of the cover."""
+        """Update the internal state of the cover.
+        
+        Only cancels the travel timer when the FSB14 reports a confirmed
+        final position (0x50 closed, 0x70 open) or an intermediate position
+        via runtime telegram (physically operated).
+        state=0x00 is a mere ACK from the bus and must NOT cancel the timer.
+        """
         try:
             decoded = self.dev_eep.decode_message(msg)
         except Exception as e:
@@ -255,40 +393,36 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
         if self.dev_eep in [G5_3F_7F]:
             LOGGER.debug(f"[cover {self.dev_id}] G5_3F_7F - {decoded.__dict__}")
 
-            ## is received as response when button pushed (command was sent) 
-            ## this message is received directly when the cover starts to move
-            ## when the cover results in completely open or close one of the following messages (open or closed) will appear
-            if decoded.state == 0x02: # down
+            if decoded.state == 0x02: # down — motor started, HA-initiated ACK, keep timer
                 self._attr_is_closing = True
                 self._attr_is_opening = False
                 self._attr_is_closed = False
-            elif decoded.state == 0x50: # closed
+            elif decoded.state == 0x50: # closed — confirmed by hardware, cancel timer
+                self._cancel_travel_task()
                 self._attr_is_opening = False
                 self._attr_is_closing = False
                 self._attr_is_closed = True
                 self._attr_current_cover_position = 0
                 self._attr_current_cover_tilt_position = 0
-            elif decoded.state == 0x01: # up
+            elif decoded.state == 0x01: # up — motor started, HA-initiated ACK, keep timer
                 self._attr_is_opening = True
                 self._attr_is_closing = False
                 self._attr_is_closed = False
-            elif decoded.state == 0x70: # open
+            elif decoded.state == 0x70: # open — confirmed by hardware, cancel timer
+                self._cancel_travel_task()
                 self._attr_is_opening = False
                 self._attr_is_closing = False
                 self._attr_is_closed = False
                 self._attr_current_cover_position = 100
                 self._attr_current_cover_tilt_position = 100
 
-            ## is received when cover stops at the desired intermediate position
-            ## if not close state is always open (close state should be reported with closed message above)
             elif decoded.time is not None and decoded.direction is not None and self._time_closes is not None and self._time_opens is not None:
+                # Intermediate position from physical button press — cancel timer, use real value
+                self._cancel_travel_task()
 
                 time_in_seconds = decoded.time / 10.0
 
                 if decoded.direction == 0x01:  # up
-                    # If the latest state is unknown, the cover position
-                    # will be set to None, therefore we have to guess
-                    # the initial position.
                     if self._attr_current_cover_position is None:
                         self._attr_current_cover_position = 0
                     
@@ -297,9 +431,6 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
                         self._attr_current_cover_tilt_position = min(self._attr_current_cover_tilt_position + int(decoded.time / self._time_tilts * 100.0), 100)
 
                 else:  # down
-                    # If the latest state is unknown, the cover position
-                    # will be set to None, therefore we have to guess
-                    # the initial position.
                     if self._attr_current_cover_position is None:
                         self._attr_current_cover_position = 100
                     
@@ -316,7 +447,6 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
                     self._attr_is_opening = False
                     self._attr_is_closing = False
 
-            
             LOGGER.debug(f"[cover {self.dev_id}] state: {self.state}, opening: {self.is_opening}, closing: {self.is_closing}, closed: {self.is_closed}, position: {self._attr_current_cover_position}")
 
             self.schedule_update_ha_state()
@@ -343,12 +473,11 @@ class EltakoCover(EltakoEntity, CoverEntity, RestoreEntity):
             
             msg = H5_3F_7F(0, command, 1).encode_message(address)
             self.send_message(msg)
-            time.sleep(sleeptime)
+            time_module.sleep(sleeptime)
             
             msg = H5_3F_7F(0, 0x00, 1).encode_message(address)
             self.send_message(msg)
 
-        
         if self.general_settings[CONF_FAST_STATUS_CHANGE]:
             if direction == "up":
                 self._attr_is_opening = True
